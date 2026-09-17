@@ -1,112 +1,157 @@
-
-
+%% =======================================================================
+%  Incremental (contraction) LMI synthesis for a discrete-time Lur'e system
+% -------------------------------------------------------------------------
+%  Numerical companion to:
+%     <A.Benchebba, "Optimal controls with incremental ISS guarantees for systems with globally Lipschitz nonlinearities", Venue, Year>   
+%     DOI / arXiv / URL: <link>                    % TODO: fill in your link
+%
+%  This script implements the Proposition 4 (verification of the LMI) and synthesizes a 
+%  state-feedback law u = -K*x - Gamma*phi(x) that renders the closed-loop Lur'e-type
+%  discrete-time system
+%
+%        x+ = A x + B u + H phi(x),      phi 1-Lipschitz (sector bounded)
+%
+%  contracting.
+%
+%  Proposition (LMI_change_of_variables). Let eps in (0,1) and
+%  Omega in R^{qxn} be such that Sx = Omega'*Omega. The following are
+%  equivalent:
+%   (i)  There exist P in S_n, R in S_m, both positive definite, and
+%        tau >= 0 such that the ORIGINAL condition (eq. LMI_W_contraction)
+%        holds.
+%   (ii) There exist X in S_n, Y in S_m, both positive definite, and
+%        theta in R_+ such that
+%
+%        [ (1-eps)*X        0          X*A'         X*Omega' ]
+%        [    *          theta*Sphi   theta*H'          0     ]   >= 0
+%        [    *              *        X+B*Y*B'          0     ]
+%        [    *              *            *         theta*I_q ]
+%
+%  Script outline:
+%    1) System data and sector/Lipschitz bound for the nonlinearity
+%    2) LMI synthesis (condition (ii) above), solved with YALMIP
+%    3) Recovery of (P, R, tau) and of the feedback gains (K*, Gamma*),
+%       with an independent numerical check of condition (i)
+%    4) Numerical validation of the contraction property:
+%         a) unforced trajectory pairs
+%         b) large-scale Monte Carlo sweep
+%         c) synchronization under a common external disturbance
+%    5) Figure
+%
+%  Requirements: YALMIP + an SDP solver (SeDuMi, SDPT3, MOSEK, ...) on the
+%  MATLAB path. The solver is auto-selected by YALMIP below; set one
+%  explicitly with sdpsettings('solver','mosek') (or similar) if needed.
+% =======================================================================
 clear; close all; clc;
-rng(0);
-% 
-% %% 1) Scalar Lur'e example:  x+ = A*x + B*u + H*phi(x),  phi 1-Lipschitz
-% A = 0.9;
-% B = 1.0;
-% H = 0.35;
-% n = size(A,1); m = size(B,2); p = size(H,2);
-% 
-% R = 1.0;
-% Lphi = 1.0;
-% Sx = Lphi^2; Sxphi = 0.0; Sphi = -1.0;      % sector matrix S
-% S = [Sx, Sxphi; Sxphi', Sphi];   % S_xphi' matters once S_xphi is a matrix (n>1 or p>1)
-% Omega = Lphi;                                    % Sx = Omega' * Omega
-% q = size(Omega,1);
-% epsn = 0.15;                                      % contraction rate target (avoid name "eps": MATLAB builtin)
-% 
-% phi = @(x) tanh(x);    % globally 1-Lipschitz: |phi(x1)-phi(x2)| <= |x1-x2|
-% 
-% %% 2) Solve eq. "LMI_change_of_variables" with YALMIP
-% X     = sdpvar(n, n, 'symmetric');
-% theta = sdpvar(1, 1);
-% Y     = sdpvar(m, n, 'full');
-% Z     = sdpvar(m, p, 'full');
-% t     = sdpvar(1, 1);                 % feasibility margin, maximized below
-% 
-% Rinv  = inv(R);
-% Acal  = A*X - B*Y;
-% Hcal  = theta*H - B*Z;
-%% Numerical Example
-% Parameters
+rng(0);   % fix the random seed so the examples below are reproducible
+
+%% ------------------------------------------------------------------
+%  1) System data: discrete-time Lur'e model  x+ = A x + B u + H phi(x)
+% ---------------------------------------------------------------------
+% Continuous-time model
 a = 1;
 b = 1.0;
 c = 1.0;
-% Continuous system
 Ac = [0,  1,  0,  0;
      -b,  0,  b,  0;
       0,  0,  0,  1;
       c,  0, -c,  0];
 Bc = [0; 0; 0; 1];
-Hc = [0; -a; 0; 0]; 
-% Discretization
-Ts = 0.01; % time step
-A = eye(4) + Ts * Ac;
-B = Ts * Bc;
-H = Ts * Hc;
-n = size(A,1); m = size(B,2); p = size(H,2);
-R = 1.0;
-Lphi = 1.0; % sin is 1 Lipschitz 
-Cq = [1, 0, 0, 0]; 
-Sx = (Lphi^2) * (Cq' * Cq); 
-Sxphi = zeros(n, p);         
-Sphi = -1.0;              
-S = [Sx, Sxphi; Sxphi', Sphi]; 
-Omega = Lphi * Cq;       % for the LMI
-q = size(Omega,1);
-epsn = 0.01;             % Contraction rate target
-phi = @(x) sin(x(1));     
+Hc = [0; -a; 0; 0];
 
-%% 2) Solve LMI
+% Forward-Euler discretization
+Ts = 0.01;                    % sampling time
+A  = eye(4) + Ts * Ac;
+B  = Ts * Bc;
+H  = Ts * Hc;
+n  = size(A, 1);
+m  = size(B, 2);
+p  = size(H, 2);
+
+% Sector / incremental Lipschitz bound for phi:
+%   |phi(x1) - phi(x2)| <= Lphi * |Cq*(x1-x2)|
+% encoded as the quadratic constraint [Dx;Dphi]' * S * [Dx;Dphi] >= 0,
+% with S = [Sx, Sxphi; Sxphi', Sphi] and Sx = Omega'*Omega.
+Cq    = [1, 0, 0, 0];
+Lphi  = 1.0;                  % sin(.) is globally 1-Lipschitz
+Sx    = (Lphi^2) * (Cq' * Cq);
+Sxphi = zeros(n, p);
+Sphi  = 1.0;
+S     = [Sx, Sxphi; Sxphi', -Sphi];
+Omega = Lphi * Cq;            % Sx = Omega' * Omega, used directly in the LMI
+q     = size(Omega, 1);
+
+epsn = 0.4;                  % target contraction rate (1 - epsn)
+phi  = @(x) sin(x(1));        % nonlinearity, applied to Cq*x
+
+%% ------------------------------------------------------------------
+%  2) LMI synthesis -- condition (ii) of the Proposition
+% ---------------------------------------------------------------------
+%  Decision variables: X in S_n (pd), Y in S_m (pd), theta in R_+.
+%  NOTE on signs: the "theta*Sphi" block below is transcribed exactly as
+%  in the Proposition. With Sphi = -1 as defined above, double-check the
+%  sign convention used for S in the paper if the solver reports the
+%  problem as infeasible.
 X     = sdpvar(n, n, 'symmetric');
+Y     = sdpvar(m, m, 'symmetric');
 theta = sdpvar(1, 1);
-Y     = sdpvar(m, n, 'full');
-Z     = sdpvar(m, p, 'full');
-t     = sdpvar(1, 1);                 % feasibility margin, maximized below
-Rinv  = inv(R);
-Acal  = A*X - B*Y;
-Hcal  = theta*H - B*Z;
-M = [ (1-epsn)*X,   -X*Sxphi,        Acal',       Y',          X*Omega';
-      -Sxphi'*X,    -theta*Sphi,  Hcal',       Z',          zeros(p,q);
-      Acal,          Hcal,           X,           zeros(n,m),  zeros(n,q);
-      Y,             Z,              zeros(m,n),  Rinv,        zeros(m,q);
-      Omega*X,       zeros(q,p),     zeros(q,n),  zeros(q,m),  theta*eye(q) ];
-Constraints = [ M - t*eye(size(M,1)) >= 0, ...
-                X - 1e-6*eye(n) >= 0 ];
+marg  = sdpvar(1, 1);          % feasibility margin, maximized below
+
+M = [ (1-epsn)*X,  zeros(n,p),   X*A',          X*Omega';
+      zeros(p,n),  theta*Sphi,   theta*H',      zeros(p,q);
+      A*X,         theta*H,      X + B*Y*B',    zeros(n,q);
+      Omega*X,     zeros(q,p),   zeros(q,n),    theta*eye(q) ];
+
+Constraints = [ M - marg*eye(size(M,1)) >= 0, ...
+                X - 1e-6*eye(n) >= 0, ...
+                Y - 1e-6*eye(m) >= 0 ];
+
 options = sdpsettings('verbose', 1);
-diagnostics = optimize(Constraints, -t, options);
+diagnostics = optimize(Constraints, -marg, options);
 if diagnostics.problem ~= 0
     warning('YALMIP/solver reported an issue: %s', diagnostics.info);
 end
-Xv = double(X); thetav = double(theta); Yv = double(Y); Zv = double(Z); tv = double(t);
-fprintf('[LMI]  feasible with margin t = %.4f > 0\n', tv);
-assert(tv > 0, 'LMI infeasible: decrease eps, check S_xx>=0, or inspect the solver output above.');
 
-%% 3) Recovering (P, tau) K*, Gamma* = Sigma^-1 B' P F
+Xv = double(X); thetav = double(theta); Yv = double(Y); margv = double(marg);
+fprintf('[LMI]  feasible with margin t = %.4f > 0\n', margv);
+assert(margv > 0, ['LMI infeasible: decrease eps, double-check the sign ' ...
+    'of S (see note above), or inspect the solver output.']);
+
+%% ------------------------------------------------------------------
+%  3) Recovering (P, R, tau) and the feedback gains (K*, Gamma*)
+% ---------------------------------------------------------------------
 P   = inv(Xv);
-tau = 1/thetav;
-Sigma = R + B'*P*B;
+Rv  = inv(Yv);           % R = Y^{-1}: recovered a posteriori (see Proposition)
+tau = 1 / thetav;
+
+Sigma = Rv + B' * P * B;
 Mp    = P - P*B*inv(Sigma)*B'*P;
 F     = [A, H];
 L     = inv(Sigma)*B'*P*F;
 Kstar     = L(:, 1:n);
 Gammastar = L(:, n+1:end);
 
-% independent re-check of the ORIGINAL condition eq. "schur_form"
+% Independent numerical check of the ORIGINAL condition, i.e. condition
+% (i) of the Proposition, using the recovered (P, R, tau).
 top = [(1-epsn)*P, zeros(n,p); zeros(p,n), zeros(p,p)];
 lhs = top - tau*S - F'*Mp*F;
 eigl = eig(lhs);
 fprintf('[LMI]  P matrix computed, original condition re-verified (min eig = %.4f)\n', min(eigl));
 assert(all(eigl > 0), 'original condition failed!');
 
-Acl = A - B*Kstar;
-Hcl = H - B*Gammastar;
-f_cl = @(x) Acl * x + Hcl * sin(Cq * x); % Supporte vecteurs (nx1) et matrices (nxN)
-Wfun = @(x1, x2) sum((x1 - x2) .* (P * (x1 - x2)), 1); % Quadratique vectorisé (1xN)
+%% ------------------------------------------------------------------
+%  Closed-loop system and incremental Lyapunov (contraction) function
+% ---------------------------------------------------------------------
+Acl  = A - B*Kstar;
+Hcl  = H - B*Gammastar;
+f_cl = @(x) Acl * x + Hcl * sin(Cq * x);                       % works for a single state (n x 1) or a batch (n x N)
+Wfun = @(x1, x2) sum((x1 - x2) .* (P * (x1 - x2)), 1);         % vectorized quadratic form V(x1,x2), returns 1 x N
 
-%% 4a) Simulated pairs 
+%% ------------------------------------------------------------------
+%  4) Numerical validation of the contraction property
+% ---------------------------------------------------------------------
+% 4a) Unforced trajectory pairs: check that W(x1_k, x2_k) contracts at
+%     the prescribed rate (1-eps) along simulated pairs of trajectories.
 T = 500;
 n_pairs = 12;
 traj1 = zeros(n, T+1, n_pairs);
@@ -138,12 +183,12 @@ else
     fprintf('  -> FAILED\n');
 end
 
-%% 4b) Montecarlo
+% 4b) Large-scale Monte Carlo sweep over random pairs in a wide box.
 N = 200000;
 x1s = -20 + 40*rand(n, N);
 x2s = -20 + 40*rand(n, N);
 mask = sqrt(sum((x1s - x2s).^2, 1)) > 1e-9;
-x1s = x1s(:, mask); 
+x1s = x1s(:, mask);
 x2s = x2s(:, mask);
 
 W0 = Wfun(x1s, x2s);
@@ -161,13 +206,15 @@ else
     fprintf('  -> FAILED\n');
 end
 
-%% 4c) Disturbance
-T = 400;
+% 4c) Synchronization under a common external disturbance: two
+%     trajectories driven by the same forcing signal should still
+%     contract towards each other (incremental / synchronization property).
+T = 200;
 kk_forcing = 0:T-1;
-w = 0.1*sin(0.1*kk_forcing) + 0.1*cos(0.1*kk_forcing);   
+w = 1*sin(0.1*kk_forcing) + 1*cos(0.1*kk_forcing);
 x1f = zeros(n, T+1); x2f = zeros(n, T+1);
-x1f(:,1) = [1; 0; 1; -1]; 
-x2f(:,1) = [-1; 1; 0; 1];
+x1f(:,1) = [1; 0; 1; -1]; %initial condition 1
+x2f(:,1) = [-1; 1; -1; 1]; %initial condition 2
 for k = 1:T
     x1f(:,k+1) = f_cl(x1f(:,k)) + [0 1 0 0]'*w(k);
     x2f(:,k+1) = f_cl(x2f(:,k)) + [0 1 0 0]'*w(k);
@@ -185,121 +232,41 @@ else
     fprintf('  -> FAILED\n');
 end
 
-% %% 5) Plots
-% figure('Position', [100 100 1100 800]);
-% 
-% % Subplot 1: Premier état (x_1) pour illustrer les trajectoires 4D des paires
-% subplot(2,2,1); hold on;
-% for i = 1:n_pairs
-%     plot(0:T, squeeze(traj1(1, :, i)), '-');
-%     plot(0:T, squeeze(traj2(1, :, i)), '--');
-% end
-% xlabel('Time step $k$', 'Interpreter', 'latex'); ylabel('state $x_1$', 'Interpreter', 'latex','FontSize',12);
-% title('12 Unforced pairs ($x_1$ component)', 'Interpreter', 'latex', 'FontSize', 14);
-% hold off;
-% 
-% % Subplot 2: Décroissance V
-% subplot(2,2,2); hold on;
-% kk = 0:T;
-% light_blue = [0.6 0.75 0.92];
-% for i = 1:n_pairs
-%     hsim1 = semilogy(kk, Wk(i,:)/Wk(i,1) + 1e-16, '-', 'Color', light_blue);
-% end
-% hbound1 = semilogy(kk, (1-epsn).^kk, 'k--', 'LineWidth', 2);
-% xlabel('Time step $k$', 'Interpreter', 'latex'); ylabel('$V(x_1^k,x_2^k)/V(x_1^0,x_2^0)$', 'Interpreter', 'latex', 'FontSize', 12);
-% title('Incremental distance vs. theoretical rate', 'Interpreter', 'latex', 'FontSize', 14);
-% legend([hsim1, hbound1], {'12 Simulations', '$(1-\epsilon)^k$ bound'}, 'Location', 'best', 'Interpreter', 'latex');
-% hold off;
-% 
-% subplot(2,2,3); hold on;
-% delta_xf = x1f - x2f; % Calcul de l'incrément entre les deux trajectoires
-% plot(0:T, delta_xf, '-', 'LineWidth', 1.5);
-% grid on;
-% xlabel('Time step $k$', 'Interpreter', 'latex'); 
-% ylabel('$\Delta x(k) = x_{1}(k) - x_{2}(k)$', 'Interpreter', 'latex', 'FontSize', 12);
-% title('Error dynamics under common forcing', 'Interpreter', 'latex', 'FontSize', 14);
-% legend({'$\Delta x_1$', '$\Delta x_2$', '$\Delta x_3$', '$\Delta x_4$'}, 'Location', 'best', 'Interpreter', 'latex');
-% hold off;
-% 
-% % Subplot 4: Décroissance V sous forçage
-% subplot(2,2,4); hold on;
-% hsim2 = semilogy(0:T, Wf/Wf(1) + 1e-16, 'r-', 'LineWidth', 1.5);
-% hbound2 = semilogy(0:T, (1-epsn).^(0:T), 'k--', 'LineWidth', 2);
-% xlabel('Time step $k$', 'Interpreter', 'latex'); ylabel('$V(x_1^k,x_2^k)/V(x_1^0,x_2^0)$', 'Interpreter', 'latex', 'FontSize', 12);
-% title('Incremental distance under common forcing', 'Interpreter', 'latex', 'FontSize', 14);
-% legend([hsim2, hbound2], {'Simulation', '$(1-\epsilon)^k$ bound'}, 'Location', 'best', 'Interpreter', 'latex');
-% hold off;
-% sgtitle('Contraction verification of the closed loop');
-% saveas(gcf, 'contraction_check.png');
-% fprintf('\nPlot saved to contraction_check.png\n');
-
-%% 6) Logarithmic scale 
+%% ------------------------------------------------------------------
+%  5) Figure: state trajectories of the two disturbed solutions
+% ---------------------------------------------------------------------
 figure('Position', [250 100 800 600]);
-
-% Utilisation de tiledlayout pour minimiser les marges et l'espacement
 tlo = tiledlayout(2, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
 
-t = 0:T;
-% S'assure que les matrices sont bien de taille (4 x T+1)
+t_axis = 0:T;
 if size(x1f, 1) ~= 4
     x1f = x1f.';
     x2f = x2f.';
 end
 
-% Palette de 4 couleurs distinctes (une par composante)
-colors = lines(4); 
+colors = lines(4);   % one distinct color per state component
 
 for i = 1:4
-    nexttile; % Remplace la commande subplot(2, 2, i)
-    hold on; grid on;
-    
-    % Trace x1 (ligne continue) et x2 (ligne pointillée) avec LA MÊME couleur
-    plot(t, x1f(i, :), '-',  'Color', colors(i, :), 'LineWidth', 1.5, ...
+    nexttile; hold on; grid on;
+    % plot x1 (solid) and x2 (dashed) for component i, same color for both
+    plot(t_axis, x1f(i, :), '-',  'Color', colors(i, :), 'LineWidth', 1.5, ...
         'DisplayName', sprintf('$x_{%d}$', i));
-    plot(t, x2f(i, :), '--', 'Color', colors(i, :), 'LineWidth', 1.5, ...
+    plot(t_axis, x2f(i, :), '--', 'Color', colors(i, :), 'LineWidth', 1.5, ...
         'DisplayName', sprintf("$x'_{%d}$", i));
-    
     xlabel('Time step $k$', 'Interpreter', 'latex');
-    legend('Location', 'best', 'Interpreter', 'latex', 'FontSize', 20); % Taille de police légèrement réduite pour un rendu optimal 
+    legend('Location', 'best', 'Interpreter', 'latex', 'FontSize', 20);
     hold off;
 end
 
-% Sauvegarde de la figure avec un recadrage automatique parfait pour LaTeX
-% Le format PDF vectoriel est recommandé pour conserver la qualité des polices LaTeX
-exportgraphics(gcf, 'ma_figure.pdf', 'ContentType', 'vector', 'BackgroundColor', 'none');
-% Titre global
-% sgtitle('State dynamics under common disturbance', 'Interpreter', 'latex', 'FontSize', 14);
+% Vector PDF export (tight crop), suitable for direct inclusion in LaTeX
+exportgraphics(gcf, 'state_trajectories.pdf', 'ContentType', 'vector', 'BackgroundColor', 'none');
+saveas(gcf, 'state_trajectories.png');
 
-% Sauvegarde de l'image
-saveas(gcf,'evolution_between_error_trajectory.png');
-
-% figure('Position', [250 250 700 500]);
-% hold on; grid on;
-% % for i = 1:n_pairs
-% %     hsim_unforced = semilogy(0:T, Wk(i,:) / Wk(i,1), '-', 'Color', light_blue, 'LineWidth', 1);
-% % end
-% hsim_f = semilogy(0:T, Wf / Wf(1), 'r-', 'LineWidth', 1.5);
-% hbound = semilogy(0:T, (1-epsn).^(0:T), 'k--', 'LineWidth', 2);
-% xlabel('Time step $k$', 'Interpreter', 'latex');
-% ylabel('$\frac{V(x_1^k, x_2^k)}{V(x_1^0, x_2^0)}$', 'Interpreter', 'latex', 'FontSize', 12);
-% title('Incremental decrease of $V$', 'Interpreter', 'latex', 'FontSize', 14);
-% legend([hsim_f, hbound], ...
-%        {'Common forcing', sprintf('Theoretical rate $(1-\\epsilon)^k$')}, ...
-%        'Location', 'southwest', 'Interpreter', 'latex');
-% xlim([0 T]);
-% set(gca, 'YScale', 'log'); 
-% hold off;
-% saveas(gcf, 'contraction_decay_V.png');
-
-
-%% Information for latex 
-% Define Sigma
-Sigma = R + Bc' * P * Bc;
-
-% Define F = [A H]
-F = [Ac Hc];
-
-% Compute W
-W = [P, zeros(size(P,1), size(Hc,2));
-     zeros(size(Hc,2), size(P,1)), zeros(size(Hc,2))] ...
-    - F' * (P - P*Bc*(Sigma\ (Bc'*P))) * F;
+%% ------------------------------------------------------------------
+%  Continuous-time cross-check (for cross-referencing)
+% ---------------------------------------------------------------------
+Sigma_c = Rv + Bc' * P * Bc;
+Fc = [Ac, Hc];
+W_check = [P, zeros(size(P,1), size(Hc,2)); ...
+           zeros(size(Hc,2), size(P,1)), zeros(size(Hc,2))] ...
+          - Fc' * (P - P*Bc*inv(Sigma_c)*Bc'*P) * Fc;
