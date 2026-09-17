@@ -4,7 +4,7 @@ This repository contains the Matlab code and the figure associated in order to p
 ## Contents
 
 * `contraction_verification.m` — MATLAB script for the contraction verification.
-* `evolution_between_error_trajectory.png` — simulation result showing the evolution of the error trajectory.
+* `state_trajectories.png` — simulation result showing the evolution of the error trajectory.
 
 ## Requirements
 
