@@ -81,17 +81,35 @@ S     = [Sx, Sxphi; Sxphi', -Sphi];
 Omega = Lphi * Cq;            % Sx = Omega' * Omega, used directly in the LMI
 q     = size(Omega, 1);
 
-epsn = 0.4;                  % target contraction rate (1 - epsn)
+epsn = 0.01;                  % target contraction rate (1 - epsn)
 phi  = @(x) sin(x(1));        % nonlinearity, applied to Cq*x
 
 %% ------------------------------------------------------------------
-%  2) LMI synthesis -- condition (ii) of the Proposition
+%  2) LMI synthesis -- condition (ii) of the Proposition 4
 % ---------------------------------------------------------------------
 %  Decision variables: X in S_n (pd), Y in S_m (pd), theta in R_+.
 %  NOTE on signs: the "theta*Sphi" block below is transcribed exactly as
 %  in the Proposition. With Sphi = -1 as defined above, double-check the
 %  sign convention used for S in the paper if the solver reports the
 %  problem as infeasible.
+%
+%  NOTE on R (input weighting): R = Y^{-1} is only recovered a posteriori
+%  (Step 3) and is not penalized by any cost in this feasibility problem
+%  (the only objective is the margin "marg"). Left unconstrained, the
+%  solver is free to push Y to very large values -- which typically costs
+%  nothing and can even relax the LMI -- causing R to collapse towards 0,
+%  i.e. an (almost) unpenalized control effort and correspondingly large
+%  gains (K*, Gamma*). To prevent this we impose a floor Rmin on R
+%  directly inside the LMI. Since R = Y^{-1} and Rmin*eye(m) is a scalar
+%  multiple of the identity, the matrix inversion lemma gives the
+%  equivalence (for positive definite Y, R):
+%
+%        R >= Rmin*eye(m)   <=>   Y <= Ymax*eye(m),   Ymax = 1/Rmin
+%
+%  so bounding R from below is enforced by bounding Y from above.
+Rmin  = 0.01;                  % <-- TUNE THIS: minimum acceptable level of R
+Ymax  = 1 / Rmin;
+
 X     = sdpvar(n, n, 'symmetric');
 Y     = sdpvar(m, m, 'symmetric');
 theta = sdpvar(1, 1);
@@ -104,7 +122,8 @@ M = [ (1-epsn)*X,  zeros(n,p),   X*A',          X*Omega';
 
 Constraints = [ M - marg*eye(size(M,1)) >= 0, ...
                 X - 1e-6*eye(n) >= 0, ...
-                Y - 1e-6*eye(m) >= 0 ];
+                Y - 1e-6*eye(m) >= 0, ...
+                Ymax*eye(m) - Y >= 0 ];      % enforces R >= Rmin*eye(m)
 
 options = sdpsettings('verbose', 1);
 diagnostics = optimize(Constraints, -marg, options);
@@ -114,8 +133,9 @@ end
 
 Xv = double(X); thetav = double(theta); Yv = double(Y); margv = double(marg);
 fprintf('[LMI]  feasible with margin t = %.4f > 0\n', margv);
-assert(margv > 0, ['LMI infeasible: decrease eps, double-check the sign ' ...
-    'of S (see note above), or inspect the solver output.']);
+assert(margv > 0, ['LMI infeasible: decrease eps, relax Rmin (increase it ' ...
+    'less, or lower it if too aggressive), double-check the sign of S ' ...
+    '(see note above), or inspect the solver output.']);
 
 %% ------------------------------------------------------------------
 %  3) Recovering (P, R, tau) and the feedback gains (K*, Gamma*)
@@ -123,6 +143,8 @@ assert(margv > 0, ['LMI infeasible: decrease eps, double-check the sign ' ...
 P   = inv(Xv);
 Rv  = inv(Yv);           % R = Y^{-1}: recovered a posteriori (see Proposition)
 tau = 1 / thetav;
+
+fprintf('[LMI]  R = %s  (floor requested: Rmin = %.4g)\n', mat2str(Rv, 4), Rmin);
 
 Sigma = Rv + B' * P * B;
 Mp    = P - P*B*inv(Sigma)*B'*P;
@@ -209,9 +231,9 @@ end
 % 4c) Synchronization under a common external disturbance: two
 %     trajectories driven by the same forcing signal should still
 %     contract towards each other (incremental / synchronization property).
-T = 200;
+T = 400;
 kk_forcing = 0:T-1;
-w = 1*sin(0.1*kk_forcing) + 1*cos(0.1*kk_forcing);
+w = 0.1*sin(0.1*kk_forcing) + 0.1*cos(0.1*kk_forcing);
 x1f = zeros(n, T+1); x2f = zeros(n, T+1);
 x1f(:,1) = [1; 0; 1; -1]; %initial condition 1
 x2f(:,1) = [-1; 1; -1; 1]; %initial condition 2
