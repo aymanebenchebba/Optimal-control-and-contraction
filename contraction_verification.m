@@ -289,6 +289,4 @@ saveas(gcf, 'state_trajectories.png');
 % ---------------------------------------------------------------------
 Sigma_c = Rv + Bc' * P * Bc;
 Fc = [Ac, Hc];
-W_check = [P, zeros(size(P,1), size(Hc,2)); ...
-           zeros(size(Hc,2), size(P,1)), zeros(size(Hc,2))] ...
-          - Fc' * (P - P*Bc*inv(Sigma_c)*Bc'*P) * Fc;
+W = lhs; %compute matrix W in the stage cost
