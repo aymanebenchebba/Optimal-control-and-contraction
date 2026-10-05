@@ -289,4 +289,4 @@ saveas(gcf, 'state_trajectories.png');
 % ---------------------------------------------------------------------
 Sigma_c = Rv + Bc' * P * Bc;
 Fc = [Ac, Hc];
-W = lhs; %compute matrix W in the stage cost
+W = blkdiag(P, zeros(p)) - F'*Mp*F; %compute matrix W in the stage cost
