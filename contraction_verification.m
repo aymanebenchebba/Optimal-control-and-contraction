@@ -268,15 +268,21 @@ end
 
 colors = lines(4);   % one distinct color per state component
 
+% Labels corresponding to x = (p_1, v_1, p_2, v_2)
+labels = {'p_1', 'v_1', 'p_2', 'v_2'};
+
 for i = 1:4
     nexttile; hold on; grid on;
-    % plot x1 (solid) and x2 (dashed) for component i, same color for both
-    plot(t_axis, x1f(i, :), '-',  'Color', colors(i, :), 'LineWidth', 1.5, ...
-        'DisplayName', sprintf('$x_{%d}$', i));
-    plot(t_axis, x2f(i, :), '--', 'Color', colors(i, :), 'LineWidth', 1.5, ...
-        'DisplayName', sprintf("$x'_{%d}$", i));
+    % Plot x1 (solid) and x2 (dashed), same color
+    plot(t_axis, x1f(i, :), '-', ...
+        'Color', colors(i, :), 'LineWidth', 1.5, ...
+        'DisplayName', ['$' labels{i} '$']);
+    plot(t_axis, x2f(i, :), '--', ...
+        'Color', colors(i, :), 'LineWidth', 1.5, ...
+        'DisplayName', ['$' labels{i} '''$']);
     xlabel('Time step $k$', 'Interpreter', 'latex');
-    legend('Location', 'best', 'Interpreter', 'latex', 'FontSize', 20);
+    legend('Location', 'best', ...
+        'Interpreter', 'latex', 'FontSize', 20);
     hold off;
 end
 
@@ -289,4 +295,4 @@ saveas(gcf, 'state_trajectories.png');
 % ---------------------------------------------------------------------
 Sigma_c = Rv + Bc' * P * Bc;
 Fc = [Ac, Hc];
-W = blkdiag(P, zeros(p)) - F'*Mp*F; %compute matrix W in the stage cost
+W = blkdiag(P, zeros(p)) - F'*Mp*F;
